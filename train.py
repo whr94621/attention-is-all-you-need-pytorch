@@ -5,6 +5,7 @@ This script handling the training process.
 import argparse
 import math
 import time
+from tensorboardX import SummaryWriter
 
 from tqdm import tqdm
 import torch
@@ -14,6 +15,8 @@ import transformer.Constants as Constants
 from transformer.Models import Transformer
 from transformer.Optim import ScheduledOptim
 from DataLoader import DataLoader
+from transformer.utils import Collections
+
 
 def get_performance(crit, pred, gold, smoothing=False, num_class=None):
     ''' Apply label smoothing if needed '''
@@ -35,8 +38,49 @@ def get_performance(crit, pred, gold, smoothing=False, num_class=None):
 
     return loss, n_correct
 
-def train_epoch(model, training_data, crit, optimizer):
-    ''' Epoch operation in training phase'''
+def eval_epoch(model, validation_data, crit):
+    ''' Epoch operation in evaluation phase '''
+
+    model.eval()
+
+    total_loss = 0
+    n_total_words = 0
+    n_total_correct = 0
+
+    for batch in validation_data:
+
+        # prepare data
+        src, tgt = batch
+        gold = tgt[0][:, 1:]
+
+        # forward
+        pred = model(src, tgt)
+        loss, n_correct = get_performance(crit, pred, gold)
+
+        # note keeping
+        n_words = gold.data.ne(Constants.PAD).sum()
+        n_total_words += n_words
+        n_total_correct += n_correct
+        total_loss += loss.data[0]
+
+    return total_loss/n_total_words, n_total_correct/n_total_words
+
+def train_epoch(opt,
+                model,
+                training_data,
+                validation_data,
+                crit,
+                optimizer,
+                collections,
+                summary_writer,
+                uidx=0):
+    '''
+    Epoch operation in training phase
+
+    :param collection: Collections
+
+    :param summary_writer: SummaryWriter
+    '''
 
     model.train()
 
@@ -53,6 +97,9 @@ def train_epoch(model, training_data, crit, optimizer):
         gold = tgt[0][:, 1:]
 
         # forward
+        uidx += 1
+
+        model.train()
         optimizer.zero_grad()
         pred = model(src, tgt)
 
@@ -70,36 +117,25 @@ def train_epoch(model, training_data, crit, optimizer):
         n_total_correct += n_correct
         total_loss += loss.data[0]
 
-    return total_loss/n_total_words, n_total_correct/n_total_words
+        if uidx % opt.eval_every_n == 0:
+            valid_loss_t, valid_acc_t = eval_epoch(model=model,
+                                                   validation_data=validation_data,
+                                                   crit=crit)
 
-def eval_epoch(model, validation_data, crit):
-    ''' Epoch operation in evaluation phase '''
+            collections.add_to_collection("valid_losses", valid_loss_t)
+            collections.add_to_collection("valid_accs", valid_acc_t)
 
-    model.eval()
+            summary_writer.add_scalar("valid_loss", valid_loss_t, global_step=uidx)
+            summary_writer.add_scalar("valid_acc", valid_acc_t, global_step=uidx)
 
-    total_loss = 0
-    n_total_words = 0
-    n_total_correct = 0
+            if opt.save_model:
+                model_name = opt.save_model + ".best.tpz"
+                if valid_acc_t >= max(collections.get_collection("valid_accs")):
+                    torch.save(model.state_dict(), model_name)
+                    print('    - [Info] The checkpoint file has been updated.')
 
-    for batch in tqdm(
-            validation_data, mininterval=2,
-            desc='  - (Validation) ', leave=False):
+    return total_loss/n_total_words, n_total_correct/n_total_words, uidx
 
-        # prepare data
-        src, tgt = batch
-        gold = tgt[0][:, 1:]
-
-        # forward
-        pred = model(src, tgt)
-        loss, n_correct = get_performance(crit, pred, gold)
-
-        # note keeping
-        n_words = gold.data.ne(Constants.PAD).sum()
-        n_total_words += n_words
-        n_total_correct += n_correct
-        total_loss += loss.data[0]
-
-    return total_loss/n_total_words, n_total_correct/n_total_words
 
 def train(model, training_data, validation_data, crit, optimizer, opt):
     ''' Start training '''
@@ -119,49 +155,67 @@ def train(model, training_data, validation_data, crit, optimizer, opt):
             log_vf.write('epoch,loss,ppl,accuracy\n')
 
     valid_accus = []
+
+    uidx = 0
+
+    collections = Collections()
+
+    summary_writer = SummaryWriter(log_dir=opt.log_path)
+
     for epoch_i in range(opt.epoch):
         print('[ Epoch', epoch_i, ']')
 
         start = time.time()
-        train_loss, train_accu = train_epoch(model, training_data, crit, optimizer)
+
+        train_loss, train_accu, uidx = train_epoch(opt=opt,
+                                             model=model,
+                                             training_data=training_data,
+                                             validation_data=validation_data,
+                                             crit=crit,
+                                             optimizer=optimizer,
+                                             collections=collections,
+                                                    summary_writer=summary_writer,
+                                             uidx=uidx)
+
         print('  - (Training)   ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
               'elapse: {elapse:3.3f} min'.format(
                   ppl=math.exp(min(train_loss, 100)), accu=100*train_accu,
                   elapse=(time.time()-start)/60))
 
-        start = time.time()
-        valid_loss, valid_accu = eval_epoch(model, validation_data, crit)
-        print('  - (Validation) ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
-                'elapse: {elapse:3.3f} min'.format(
-                    ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu,
-                    elapse=(time.time()-start)/60))
-
-        valid_accus += [valid_accu]
-
-        model_state_dict = model.state_dict()
-        checkpoint = {
-            'model': model_state_dict,
-            'settings': opt,
-            'epoch': epoch_i}
-
-        if opt.save_model:
-            if opt.save_mode == 'all':
-                model_name = opt.save_model + '_accu_{accu:3.3f}.chkpt'.format(accu=100*valid_accu)
-                torch.save(checkpoint, model_name)
-            elif opt.save_mode == 'best':
-                model_name = opt.save_model + '.chkpt'
-                if valid_accu >= max(valid_accus):
-                    torch.save(checkpoint, model_name)
-                    print('    - [Info] The checkpoint file has been updated.')
-
-        if log_train_file and log_valid_file:
-            with open(log_train_file, 'a') as log_tf, open(log_valid_file, 'a') as log_vf:
-                log_tf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
-                    epoch=epoch_i, loss=train_loss,
-                    ppl=math.exp(min(train_loss, 100)), accu=100*train_accu))
-                log_vf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
-                    epoch=epoch_i, loss=valid_loss,
-                    ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu))
+        #
+        # start = time.time()
+        # valid_loss, valid_accu = eval_epoch(model, validation_data, crit)
+        # print('  - (Validation) ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
+        #         'elapse: {elapse:3.3f} min'.format(
+        #             ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu,
+        #             elapse=(time.time()-start)/60))
+        #
+        # valid_accus += [valid_accu]
+        #
+        # model_state_dict = model.state_dict()
+        # checkpoint = {
+        #     'model': model_state_dict,
+        #     'settings': opt,
+        #     'epoch': epoch_i}
+        #
+        # if opt.save_model:
+        #     if opt.save_mode == 'all':
+        #         model_name = opt.save_model + '_accu_{accu:3.3f}.chkpt'.format(accu=100*valid_accu)
+        #         torch.save(checkpoint, model_name)
+        #     elif opt.save_mode == 'best':
+        #         model_name = opt.save_model + '.chkpt'
+        #         if valid_accu >= max(valid_accus):
+        #             torch.save(checkpoint, model_name)
+        #             print('    - [Info] The checkpoint file has been updated.')
+        #
+        # if log_train_file and log_valid_file:
+        #     with open(log_train_file, 'a') as log_tf, open(log_valid_file, 'a') as log_vf:
+        #         log_tf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
+        #             epoch=epoch_i, loss=train_loss,
+        #             ppl=math.exp(min(train_loss, 100)), accu=100*train_accu))
+        #         log_vf.write('{epoch},{loss: 8.5f},{ppl: 8.5f},{accu:3.3f}\n'.format(
+        #             epoch=epoch_i, loss=valid_loss,
+        #             ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu))
 
 def main():
     ''' Main function '''
@@ -190,7 +244,11 @@ def main():
     parser.add_argument('-save_model', default=None)
     parser.add_argument('-save_mode', type=str, choices=['all', 'best'], default='best')
 
+    parser.add_argument("-eval_every_n", type=int, default=100)
+    parser.add_argument("-log_path", type=str)
+
     parser.add_argument('-no_cuda', action='store_true')
+
 
     opt = parser.parse_args()
     opt.cuda = not opt.no_cuda
